@@ -92,6 +92,13 @@
   <ItemGroup>
     <ClCompile Include="PadDriver.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Common.h" />
+    <ClInclude Include="PadDriver.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="PadDriver.inf" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
