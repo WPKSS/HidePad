@@ -189,6 +189,51 @@ NTSTATUS DriverRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	return CompleteIrp(Irp, STATUS_SUCCESS, sizeof(DEVICE_LIST_DATA));
 }
 
+NTSTATUS DriverWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	auto stack = IoGetCurrentIrpStackLocation(Irp);
+	auto len = stack->Parameters.Write.Length;
+	if (len > sizeof(WCHAR) * NAME_BUFFER || len == 0)
+	{
+		return CompleteIrp(Irp, STATUS_INVALID_BUFFER_SIZE);
+	}
+
+	WCHAR buffer[NAME_BUFFER];
+
+	WCHAR* temp_name = (WCHAR*)Irp->UserBuffer;
+	if (buffer == nullptr)
+	{
+		KdPrint((TAG ": ERROR(BUFFER NULL POINTER, DriverWrite)"));
+		return STATUS_BAD_DATA;
+	}
+	memset(buffer, 0, sizeof(buffer));
+	wcsncpy(buffer, temp_name, len / sizeof(WCHAR) - 1);
+	buffer[255] = '\0';
+
+	UNICODE_STRING targetName;
+	RtlInitUnicodeString(&targetName, buffer);
+
+	PFILE_OBJECT FileObject;
+	PDEVICE_OBJECT LowerDeviceObject;
+
+	auto status = IoGetDeviceObjectPointer(&targetName, FILE_ALL_ACCESS, &FileObject, &LowerDeviceObject);
+
+	if (!NT_SUCCESS(status))
+	{
+		KdPrint((TAG ": ERROR(IoGetDeviceObjectPointer, DriverWrite) (0x%X)\n", status));
+		return status;
+	}
+
+	PDEVICE_OBJECT FilterObject;
+	status = IoCreateDevice(DeviceObject->DriverObject, sizeof(DeviceExtension), nullptr, FILE_DEVICE_UNKNOWN, 0, FALSE, &FilterObject);
+
+	auto ext = (DeviceExtension*)DeviceObject->DeviceExtension;
+
+	ObDereferenceObject(FileObject);
+
+
+}
+
 NTSTATUS DriverDeviceIntercept(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
 {
 	auto deviceState = (PULONG)Irp->IoStatus.Information;
@@ -317,7 +362,7 @@ NTSTATUS DriverControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		return CompleteIrp(Irp, STATUS_INVALID_BUFFER_SIZE);
 	}
 	WCHAR* temp_name = (WCHAR*)Irp->AssociatedIrp.SystemBuffer;
-	WCHAR buffer[256];
+	WCHAR buffer[NAME_BUFFER];
 	memset(buffer, 0, sizeof(buffer));
 	wcsncpy(buffer, temp_name, inputLen/sizeof(WCHAR) - 1);
 	buffer[255] = '\0';
@@ -411,6 +456,13 @@ NTSTATUS DriverDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		{
 			status = DriverPNP(DeviceObject, Irp);
 		}
+		else if (code == IRP_MJ_POWER)
+		{
+			PoStartNextPowerIrp(Irp);
+			IoSkipCurrentIrpStackLocation(Irp);
+			status = PoCallDriver(ext->LowerDeviceObject, Irp);
+			IoReleaseRemoveLock(&ext->RemoveLock, Irp);
+		}
 		else
 		{
 			IoSkipCurrentIrpStackLocation(Irp);
@@ -424,8 +476,11 @@ NTSTATUS DriverDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 {
 	//UNREFERENCED_PARAMETER(DriverObject);
-	UNREFERENCED_PARAMETER(RegistryPath);
-	UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\HidePad");
+	IoRegisterDriverReinitialization(DriverObject, NULL, NULL);
+	if (RegistryPath) {
+		KdPrint((TAG ": RegistryPath: %wZ\n", RegistryPath));
+	}
+	UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\PadDriver");
 	PDEVICE_OBJECT DeviceObject;
 
 	auto status = IoCreateDevice(DriverObject, 0, &devName, FILE_DEVICE_UNKNOWN, 0, TRUE, &DeviceObject);
@@ -449,7 +504,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
 	}
 	globals->CDO = DeviceObject;
 
-	UNICODE_STRING linkName = RTL_CONSTANT_STRING(L"\\??\\HidePad");
+	UNICODE_STRING linkName = RTL_CONSTANT_STRING(L"\\??\\PadDriver");
 	status = IoCreateSymbolicLink(&linkName, &devName);
 	if (!NT_SUCCESS(status))
 	{

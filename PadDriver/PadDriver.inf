@@ -1,11 +1,11 @@
 [Version]
 Signature="$WINDOWS NT$"
-Class=HIDClass
-ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider=%Provider%
-CatalogFile=PadDriver.cat
 DriverVer=01/01/2024,1.0.0.0
 PnpLockdown=1
+CatalogFile=PadDriver.cat
 
 [Manufacturer]
 %Manufacturer%=Models,NTamd64
@@ -14,13 +14,9 @@ PnpLockdown=1
 %DeviceDesc%=PadDriver_Install,HID_DEVICE
 
 [PadDriver_Install.NT]
-Include=hidclass.inf
-Needs=HIDClass.NT
 CopyFiles=PadDriver_CopyFiles
 
 [PadDriver_Install.NT.Services]
-Include=hidclass.inf
-Needs=HIDClass.NT.Services
 AddService=PadDriver,0x00000002,PadDriver_Service
 
 [PadDriver_Service]
