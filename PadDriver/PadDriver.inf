@@ -1,36 +1,52 @@
 [Version]
 Signature="$WINDOWS NT$"
-Class=System
-ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Class=HIDClass
+ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
 Provider=%Provider%
-DriverVer=01/01/2024,1.0.0.0
-PnpLockdown=1
+DriverVer=01/13/2026,1.0.0.1
 CatalogFile=PadDriver.cat
+PnpLockdown=1
 
 [Manufacturer]
-%Manufacturer%=Models,NTamd64
+; Deklarujemy, ¿e u¿ywamy sekcji z sufiksem wersji (wymagane dla AddFilter)
+%Manufacturer%=Models,NTamd64.10.0...18362
 
-[Models.NTamd64]
-%DeviceDesc%=PadDriver_Install,HID_DEVICE
+; --- NAPRAWIONO: Ta nazwa musi byæ identyczna jak deklaracja wy¿ej ---
+[Models.NTamd64.10.0...18362]
+; U¿ywamy generic HID Device System Game dla testów
+%DeviceDesc%=PadDriver_Install, HID_DEVICE_SYSTEM_GAME
+; Opcjonalnie konkretny VID/PID (odkomentuj jeœli potrzebne):
+;%DeviceDesc%=PadDriver_Install, HID\VID_045E&PID_028E
 
 [PadDriver_Install.NT]
+; Dziedziczymy sterownik funkcji HID
+Include=input.inf
+Needs=HID_Inst.NT
 CopyFiles=PadDriver_CopyFiles
 
+[PadDriver_Install.NT.HW]
+Include=input.inf
+Needs=HID_Inst.NT.HW
+; PUSTO - AddReg nie jest ju¿ potrzebne dziêki sekcji Filters poni¿ej
+
+; --- Sekcja Filters (dzia³a tylko na Win 10 1903+) ---
+[PadDriver_Install.NT.Filters]
+AddFilter = PadDriver,, PadDriver_Filter_Inst
+
+[PadDriver_Filter_Inst]
+FilterPosition = Upper
+
 [PadDriver_Install.NT.Services]
-AddService=PadDriver,0x00000002,PadDriver_Service
+Include=input.inf
+Needs=HID_Inst.NT.Services
+AddService=PadDriver,,PadDriver_Service
 
 [PadDriver_Service]
 DisplayName="PadDriver HID Filter"
-ServiceType=1
-StartType=3
-ErrorControl=1
+ServiceType=1               ; SERVICE_KERNEL_DRIVER
+StartType=3                 ; SERVICE_DEMAND_START
+ErrorControl=1              ; SERVICE_ERROR_NORMAL
 ServiceBinary=%12%\PadDriver.sys
-
-[PadDriver_Install.NT.HW]
-AddReg=PadDriver_AddReg
-
-[PadDriver_AddReg]
-HKR,,"UpperFilters",0x00010008,"PadDriver"
 
 [PadDriver_CopyFiles]
 PadDriver.sys

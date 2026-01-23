@@ -25,7 +25,7 @@ struct g_data
 	PDEVICE_OBJECT CDO;
 	Monitored_Device devices[MAX_DEVICES];
 	short Count;
-	FAST_MUTEX fMutex;
+	KSPIN_LOCK sLock;
 };
 
 g_data* globals;
@@ -42,7 +42,7 @@ NTSTATUS CompleteIrp(PIRP Irp, NTSTATUS status = STATUS_SUCCESS, ULONG_PTR info 
 void SampleUnload(_In_ PDRIVER_OBJECT DriverObject)
 {
 	ExFreePoolWithTag(globals, TAG_MEM);
-	UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\HidePad");
+	UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\PadDriver");
 	IoDeleteSymbolicLink(&symLink);
 	IoDeleteDevice(DriverObject->DeviceObject);
 	KdPrint(("Unloaded driver.\n"));
@@ -83,7 +83,7 @@ NTSTATUS FilterAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PDO)
 	WCHAR temp_name[NAME_BUFFER];
 	ULONG size = 0;
 	status = IoGetDeviceProperty(PDO, DevicePropertyHardwareID, 0, NULL, &size);
-	if (!NT_SUCCESS(status))
+	if (NT_SUCCESS(status))
 	{
 		KdPrint((TAG ": ERROR(IoGetDeviceProperty1, AddDevice) (0x%X)\n", status));
 		IoDetachDevice(ext->LowerDeviceObject);
@@ -109,7 +109,8 @@ NTSTATUS FilterAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PDO)
 		return status;
 	}
 
-	ExAcquireFastMutex(&globals->fMutex);
+	KIRQL oldIrql;
+	KeAcquireSpinLock(&globals->sLock, &oldIrql);
 	for (short i = 0; i < MAX_DEVICES; i++)
 	{
 		if (globals->devices[i].DeviceObject == nullptr)
@@ -145,9 +146,11 @@ NTSTATUS FilterAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PDO)
 		}*/
 		globals->Count++;
 	}
-	ExReleaseFastMutex(&globals->fMutex);
+	KeReleaseSpinLock(&globals->sLock, oldIrql);
 	IoInitializeRemoveLock(&ext->RemoveLock, TAG_MEM, 0, 0);
 	DeviceObject->DeviceType = ext->LowerDeviceObject->DeviceType;
+	DeviceObject->Characteristics = ext->LowerDeviceObject->Characteristics;
+	DeviceObject->Characteristics |= FILE_DEVICE_SECURE_OPEN;
 	DeviceObject->Flags |= ext->LowerDeviceObject->Flags & (DO_BUFFERED_IO | DO_DIRECT_IO);
 
 	DeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
@@ -158,33 +161,78 @@ NTSTATUS FilterAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PDO)
 	return status;
 }
 
-NTSTATUS DriverRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+NTSTATUS ReadCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
 {
-	UNREFERENCED_PARAMETER(DeviceObject);
-	//NTSTATUS status = STATUS_SUCCESS;
-	auto stack = IoGetCurrentIrpStackLocation(Irp);
-	auto len = stack->Parameters.Read.Length;
-	if (len < sizeof(DEVICE_LIST_DATA))
+	auto deviceState = Irp->AssociatedIrp.SystemBuffer;
+	auto deviceSize = (PULONG)Irp->IoStatus.Information;
+	auto status = Irp->IoStatus.Status;
+	KIRQL oldIrql;
+	if (deviceState == nullptr)
 	{
-		return CompleteIrp(Irp, STATUS_INVALID_BUFFER_SIZE);
+		KdPrint((TAG ": ERROR(DEVICE STATE NULL POINTER, ReadCompletionRoutine) (0x%X)\n", status));
+		return status;
 	}
-	
-	PDEVICE_LIST_DATA buffer = (PDEVICE_LIST_DATA)Irp->AssociatedIrp.SystemBuffer;
-
-	memset(buffer, 0, sizeof(DEVICE_LIST_DATA));
-
-	short deviceCount = 0;
-	ExAcquireFastMutex(&globals->fMutex);
+	if (deviceSize == 0)
+	{
+		KdPrint((TAG ": ERROR(DEVICE SIZE EQUALS 0, ReadCompletionRoutine) (0x%X)\n", status));
+		return status;
+	}
+	UNREFERENCED_PARAMETER(Context);
+	KeAcquireSpinLock(&globals->sLock, &oldIrql);
 	for (int i = 0; i < MAX_DEVICES; i++)
 	{
-		if (globals->devices[i].name[0] != '\0')
+		if (globals->devices[i].DeviceObject != DeviceObject)
 		{
-			wcsncpy(buffer->DeviceNames[deviceCount], globals->devices[i].name, NAME_BUFFER);
-			deviceCount++;
+			continue;
+		}
+		if (globals->devices[i].blocked == true)
+		{
+			RtlZeroMemory(Irp->AssociatedIrp.SystemBuffer, Irp->IoStatus.Information);
+			//Irp->IoStatus.Information = 0;
+			return STATUS_SUCCESS;
 		}
 	}
-	ExReleaseFastMutex(&globals->fMutex);
-	buffer->Count = deviceCount;
+	KeReleaseSpinLock(&globals->sLock, oldIrql);
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS DriverRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	if (DeviceObject == globals->CDO)
+	{
+		//NTSTATUS status = STATUS_SUCCESS;
+		auto stack = IoGetCurrentIrpStackLocation(Irp);
+		auto len = stack->Parameters.Read.Length;
+		if (len < sizeof(DEVICE_LIST_DATA))
+		{
+			return CompleteIrp(Irp, STATUS_INVALID_BUFFER_SIZE);
+		}
+
+		PDEVICE_LIST_DATA buffer = (PDEVICE_LIST_DATA)Irp->AssociatedIrp.SystemBuffer;
+
+		memset(buffer, 0, sizeof(DEVICE_LIST_DATA));
+
+		short deviceCount = 0;
+		KIRQL oldIrql;
+		KeAcquireSpinLock(&globals->sLock, &oldIrql);
+		for (int i = 0; i < MAX_DEVICES; i++)
+		{
+			if (globals->devices[i].name[0] != '\0')
+			{
+				wcsncpy(buffer->DeviceNames[deviceCount], globals->devices[i].name, NAME_BUFFER);
+				buffer->blocked[i] = globals->devices[i].blocked;
+				deviceCount++;
+			}
+		}
+		KeReleaseSpinLock(&globals->sLock, oldIrql);
+		buffer->Count = deviceCount;
+	}
+	else
+	{
+		//auto ext = (DeviceExtension*)DeviceObject->DeviceExtension;
+		IoSkipCurrentIrpStackLocation(Irp);
+		IoSetCompletionRoutine(Irp, ReadCompletionRoutine, NULL, TRUE, FALSE, FALSE);
+	}
 
 	return CompleteIrp(Irp, STATUS_SUCCESS, sizeof(DEVICE_LIST_DATA));
 }
@@ -193,15 +241,21 @@ NTSTATUS DriverWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
 	auto stack = IoGetCurrentIrpStackLocation(Irp);
 	auto len = stack->Parameters.Write.Length;
+	short index = -1;
 	if (len > sizeof(WCHAR) * NAME_BUFFER || len == 0)
 	{
 		return CompleteIrp(Irp, STATUS_INVALID_BUFFER_SIZE);
 	}
 
+	if (globals->Count > 63)
+	{
+		return CompleteIrp(Irp, STATUS_TOO_MANY_ADDRESSES);
+	}
+
 	WCHAR buffer[NAME_BUFFER];
 
-	WCHAR* temp_name = (WCHAR*)Irp->UserBuffer;
-	if (buffer == nullptr)
+	WCHAR* temp_name = (WCHAR*)Irp->AssociatedIrp.SystemBuffer;
+	if (temp_name == nullptr)
 	{
 		KdPrint((TAG ": ERROR(BUFFER NULL POINTER, DriverWrite)"));
 		return STATUS_BAD_DATA;
@@ -227,11 +281,77 @@ NTSTATUS DriverWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	PDEVICE_OBJECT FilterObject;
 	status = IoCreateDevice(DeviceObject->DriverObject, sizeof(DeviceExtension), nullptr, FILE_DEVICE_UNKNOWN, 0, FALSE, &FilterObject);
 
-	auto ext = (DeviceExtension*)DeviceObject->DeviceExtension;
+	if (!NT_SUCCESS(status))
+	{
+		KdPrint((TAG ": ERROR(IoCreateDevice, DriverWrite) (0x%X)\n", status));
+		return status;
+	}
+
+	auto ext = (DeviceExtension*)FilterObject->DeviceExtension;
+
+	FilterObject->Flags |= LowerDeviceObject->Flags &
+		(DO_BUFFERED_IO | DO_DIRECT_IO);
+	FilterObject->Flags &= ~DO_DEVICE_INITIALIZING;
+	FilterObject->Flags |= DO_POWER_PAGABLE;
+	FilterObject->DeviceType = LowerDeviceObject->DeviceType;
+	
+	ext->index = -1;
+	//ext->LowerDeviceObject = LowerDeviceObject;
+	IoInitializeRemoveLock(&ext->RemoveLock, TAG_MEM, 0, 0);
+
+	status = IoAttachDeviceToDeviceStackSafe(FilterObject, LowerDeviceObject, &ext->LowerDeviceObject);
+
+	if (!NT_SUCCESS(status))
+	{
+		KdPrint((TAG ": ERROR(IoAttachDeviceToDeviceStackSafe, DriverWrite) (0x%X)\n", status));
+		IoDeleteDevice(FilterObject);
+		return status;
+	}
+
+	KIRQL oldIrql;
+	KeAcquireSpinLock(&globals->sLock, &oldIrql);
+	for (short i = 0; i < MAX_DEVICES; i++)
+	{
+		if (globals->devices[i].DeviceObject == nullptr)
+		{
+			if (index < 0)
+			{
+				index = i;
+			}
+		}
+		else
+		{
+			if (_wcsicmp(temp_name, globals->devices[i].name) == 0)
+			{
+				globals->devices[i].DeviceObject = FilterObject; //if exists, insert pointer
+				ext->index = i;
+				break;
+			}
+		}
+	}
+	if (ext->index == -1)
+	{
+		ext->index = index; //if doesnt exist, insert into first available slot
+		globals->devices[ext->index].DeviceObject = FilterObject;
+		globals->devices[ext->index].blocked = false;
+		wcsncpy(globals->devices[ext->index].name, buffer, NAME_BUFFER);
+		//status = IoGetDeviceProperty(PDO, DevicePropertyHardwareID, NAME_BUFFER * sizeof(WCHAR), globals->devices[ext->index].name, &size);
+		/*if (!NT_SUCCESS(status))
+		{
+			KdPrint((TAG ": ERROR(IoGetDeviceProperty2, AddDevice) (0x%X)\n", status));
+			IoDetachDevice(ext->LowerDeviceObject);
+			IoDeleteDevice(DeviceObject);
+			return status;
+		}*/
+		globals->Count++;
+	}
+	KeReleaseSpinLock(&globals->sLock, oldIrql);
+
+
 
 	ObDereferenceObject(FileObject);
 
-
+	return status;
 }
 
 NTSTATUS DriverDeviceIntercept(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
@@ -311,6 +431,7 @@ NTSTATUS DriverPNP(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	auto stack = IoGetCurrentIrpStackLocation(Irp);
 	auto code = stack->MinorFunction;
 	auto ext = (DeviceExtension*)DeviceObject->DeviceExtension;
+	KdPrint((TAG ": Dispatch minor function(%d) \n", code));
 	if (code == IRP_MN_REMOVE_DEVICE)
 	{
 		IoReleaseRemoveLockAndWait(&ext->RemoveLock, Irp);
@@ -318,14 +439,15 @@ NTSTATUS DriverPNP(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		status = IoCallDriver(ext->LowerDeviceObject, Irp);
 
 		IoDetachDevice(ext->LowerDeviceObject);
-		ExAcquireFastMutex(&globals->fMutex);
+		KIRQL oldIrql;
+		KeAcquireSpinLock(&globals->sLock, &oldIrql);
 		globals->devices[ext->index].DeviceObject = nullptr;
 		if (globals->devices[ext->index].blocked == false)
 		{
 			memset(globals->devices[ext->index].name, 0, sizeof(globals->devices[ext->index].name));
 			globals->Count--;
 		}
-		ExReleaseFastMutex(&globals->fMutex);
+		KeReleaseSpinLock(&globals->sLock, oldIrql);
 		IoDeleteDevice(DeviceObject);
 		return status;
 	}
@@ -342,11 +464,13 @@ NTSTATUS DriverPNP(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
 			default:
 				IoSkipCurrentIrpStackLocation(Irp);
+				IoReleaseRemoveLock(&ext->RemoveLock, Irp);
 				status = IoCallDriver(ext->LowerDeviceObject, Irp);
 				break;
 		}
-		IoReleaseRemoveLock(&ext->RemoveLock, Irp);
+		//IoReleaseRemoveLock(&ext->RemoveLock, Irp);
 	}
+	KdPrint((TAG ": PNP STATUS(%d) \n", status));
 	return status;
 }
 
@@ -366,49 +490,79 @@ NTSTATUS DriverControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	memset(buffer, 0, sizeof(buffer));
 	wcsncpy(buffer, temp_name, inputLen/sizeof(WCHAR) - 1);
 	buffer[255] = '\0';
-
+	KIRQL oldIrql;
 	switch (dic.IoControlCode)
 	{
 		case IOCTL_DEV_ADD:
-			ExAcquireFastMutex(&globals->fMutex);
+
+			KeAcquireSpinLock(&globals->sLock, &oldIrql);
 			for (int i = 0; i < MAX_DEVICES; i++)
 			{
 				if (_wcsicmp(buffer, globals->devices[i].name) == 0 && globals->devices[i].DeviceObject != nullptr)
 				{
 					globals->devices[i].blocked = true;
-					auto ext = (DeviceExtension*)globals->devices[i].DeviceObject->DeviceExtension;
-					ExReleaseFastMutex(&globals->fMutex);
-					IoInvalidateDeviceState(ext->PDO);
+					//auto ext = (DeviceExtension*)globals->devices[i].DeviceObject->DeviceExtension;
+					KeReleaseSpinLock(&globals->sLock, oldIrql);
+					//IoInvalidateDeviceState(ext->PDO);
 					return CompleteIrp(Irp);
 				}
 			}
-			ExReleaseFastMutex(&globals->fMutex);
+			KeReleaseSpinLock(&globals->sLock, oldIrql);
 			break;
 		case IOCTL_DEV_REMOVE:
-			ExAcquireFastMutex(&globals->fMutex);
+			KeAcquireSpinLock(&globals->sLock, &oldIrql);
 			for (int i = 0; i < MAX_DEVICES; i++)
 			{
 				if (_wcsicmp(buffer, globals->devices[i].name) == 0 && globals->devices[i].DeviceObject == nullptr)
 				{
 					globals->devices[i].blocked = false;
 					memset(globals->devices[i].name, 0, sizeof(globals->devices[i].name));
-					ExReleaseFastMutex(&globals->fMutex);
+					KeReleaseSpinLock(&globals->sLock, oldIrql);
 					return CompleteIrp(Irp);
 				}
 
 				if (_wcsicmp(buffer, globals->devices[i].name) == 0 && globals->devices[i].DeviceObject != nullptr)
 				{
 					globals->devices[i].blocked = false;
-					auto ext = (DeviceExtension*)globals->devices[i].DeviceObject->DeviceExtension;
-					ExReleaseFastMutex(&globals->fMutex);
-					IoInvalidateDeviceState(ext->PDO);
+					//auto ext = (DeviceExtension*)globals->devices[i].DeviceObject->DeviceExtension;
+					KeReleaseSpinLock(&globals->sLock, oldIrql);
+					//IoInvalidateDeviceState(ext->PDO);
 					return CompleteIrp(Irp);
 				}
 			}
-			ExReleaseFastMutex(&globals->fMutex);
+			KeReleaseSpinLock(&globals->sLock, oldIrql);
 			break;
 	}
 	return CompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST);
+}
+
+NTSTATUS DriverCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	KIRQL oldIrql;
+	auto ext = (DeviceExtension*)DeviceObject->DeviceExtension;
+	KeAcquireSpinLock(&globals->sLock, &oldIrql);
+	for (int i = 0; i < MAX_DEVICES; i++)
+	{
+		if (globals->devices[i].DeviceObject == DeviceObject)
+		{
+			if (globals->devices[i].blocked == true)
+			{
+				KdPrint((TAG "BLOCKING DEVICE CREATE FOR DEVICE: %ws", globals->devices[i].name));
+				KeReleaseSpinLock(&globals->sLock, oldIrql);
+				return CompleteIrp(Irp, STATUS_ACCESS_DENIED);
+			}
+			else
+			{
+				IoSkipCurrentIrpStackLocation(Irp);
+				KeReleaseSpinLock(&globals->sLock, oldIrql);
+				status = IoCallDriver(ext->LowerDeviceObject, Irp);
+				return status;
+			}
+		}
+	}
+	KeReleaseSpinLock(&globals->sLock, oldIrql);
+	return status;
 }
 
 NTSTATUS DriverDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
@@ -417,15 +571,17 @@ NTSTATUS DriverDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	auto stack = IoGetCurrentIrpStackLocation(Irp);
 	auto code = stack->MajorFunction;
 	auto ext = (DeviceExtension*)DeviceObject->DeviceExtension;
-	KdPrint((TAG ": Dispatch major function(%d) \n", stack->MajorFunction ));
+	//KdPrint((TAG ": Dispatch major function(%d) \n", stack->MajorFunction ));
 	if (DeviceObject == globals->CDO)
 	{ //is deviceobject our main device or filter devices(intercepters)
 		switch (code)
 		{
 			case IRP_MJ_CREATE:
 			case IRP_MJ_CLOSE:
-			case IRP_MJ_WRITE:
 				return CompleteIrp(Irp);
+				break;
+			case IRP_MJ_WRITE:
+				return DriverWrite(DeviceObject, Irp);
 				break;
 			case IRP_MJ_READ:
 				return DriverRead(DeviceObject, Irp);
@@ -463,6 +619,16 @@ NTSTATUS DriverDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 			status = PoCallDriver(ext->LowerDeviceObject, Irp);
 			IoReleaseRemoveLock(&ext->RemoveLock, Irp);
 		}
+		else if (code == IRP_MJ_READ)
+		{
+			status = DriverRead(DeviceObject, Irp);
+			IoReleaseRemoveLock(&ext->RemoveLock, Irp);
+		}
+		else if (code == IRP_MJ_CREATE)
+		{
+			status = DriverCreate(DeviceObject, Irp);
+			IoReleaseRemoveLock(&ext->RemoveLock, Irp);
+		}
 		else
 		{
 			IoSkipCurrentIrpStackLocation(Irp);
@@ -476,14 +642,14 @@ NTSTATUS DriverDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 {
 	//UNREFERENCED_PARAMETER(DriverObject);
-	IoRegisterDriverReinitialization(DriverObject, NULL, NULL);
+	//IoRegisterDriverReinitialization(DriverObject, NULL, NULL);
 	if (RegistryPath) {
 		KdPrint((TAG ": RegistryPath: %wZ\n", RegistryPath));
 	}
 	UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\PadDriver");
 	PDEVICE_OBJECT DeviceObject;
 
-	auto status = IoCreateDevice(DriverObject, 0, &devName, FILE_DEVICE_UNKNOWN, 0, TRUE, &DeviceObject);
+	auto status = IoCreateDevice(DriverObject, sizeof(DeviceExtension), &devName, FILE_DEVICE_UNKNOWN, 0, TRUE, &DeviceObject);
 	if (!NT_SUCCESS(status))
 	{
 		KdPrint((TAG ": ERROR(IoCreateDevice, DriverEntry) (0x%X)\n", status));
@@ -525,7 +691,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
 
 	DriverObject->DriverExtension->AddDevice = FilterAddDevice;
 	DriverObject->DriverUnload = SampleUnload;
-	ExInitializeFastMutex(&globals->fMutex);
+	KeInitializeSpinLock(&globals->sLock);
 	KdPrint((TAG ": STARTED\n"));
 
 	/*

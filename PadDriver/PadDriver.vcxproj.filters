@@ -19,11 +19,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="PadDriver.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
     <ClInclude Include="Common.h">
       <Filter>Source Files</Filter>
     </ClInclude>
@@ -32,8 +27,8 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <Inf Include="PadDriver.inf">
+    <ClCompile Include="PadDriver.cpp">
       <Filter>Source Files</Filter>
-    </Inf>
+    </ClCompile>
   </ItemGroup>
 </Project>
